@@ -6,6 +6,7 @@ from PIL import Image
 import copy
 import pydantic
 import sys
+import cv2
 
 import gradio as gr
 
@@ -222,7 +223,115 @@ def controlnet_api(_: gr.Blocks, app: FastAPI):
         global_state.cn_preprocessor_unloadable.get(controlnet_module, lambda: None)()
         results64 = list(map(encode_to_base64, results))
         return {"images": results64, "info": "Success"}
+    
+    @app.post("/controlnet/detect-precise")
+    async def detect(
+        controlnet_module: str = Body("none", title='Controlnet Module'),
+        controlnet_input_images: List[str] = Body([], title='Controlnet Input Images'),
+        controlnet_threshold_a: float = Body(64, title='Controlnet Threshold a'),
+        controlnet_threshold_b: float = Body(64, title='Controlnet Threshold b'),
+        controlnet_crop_transparent: bool = Body(False, title='Crop Transparent'),
+    ):
+        controlnet_module = global_state.reverse_preprocessor_aliases.get(controlnet_module, controlnet_module)
 
+        if controlnet_module not in global_state.cn_preprocessor_modules:
+            return {"images": [], "info": "Module not available"}
+        if len(controlnet_input_images) == 0:
+            return {"images": [], "info": "No image(s) selected"}
+        
+        print(f"Detecting {str(len(controlnet_input_images))} objects with the {controlnet_module} module.")
+
+        results = []
+
+        processor_module = global_state.cn_preprocessor_modules[controlnet_module]
+
+        for input_image in controlnet_input_images:
+            img = external_code.to_base64_nparray(input_image)
+
+            if len(img.shape) == 2 or (len(img.shape) == 3 and img.shape[2] == 1):
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGBA)
+            elif len(img.shape) == 3 and img.shape[2] == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2RGBA)
+
+            hasTransparent = False
+            for i in range(img.shape[0]):
+                for j in range(img.shape[1]):
+                    if img[i][j][3] == 0:
+                        hasTransparent = True
+                        break
+
+            img_copy = img.copy()
+
+            if hasTransparent:
+                img_copy[img_copy[:,:,3] == 0] = [255, 255, 255, 255]
+
+            if img.shape[0] > img.shape[1]:
+                img_copy = np.pad(img_copy, ((0,0),(0,img.shape[0]-img.shape[1]),(0,0)), mode='edge')
+            elif img.shape[1] > img.shape[0]:
+                img_copy = np.pad(img_copy, ((0,img.shape[1]-img.shape[0]),(0,0),(0,0)), mode='edge')
+
+            resolution = img_copy.shape[0]
+
+            result = processor_module(img_copy, res=resolution, thr_a=controlnet_threshold_a, thr_b=controlnet_threshold_b)[0]
+            result = cv2.resize(result, (resolution, resolution), interpolation=cv2.INTER_AREA)
+            result = np.array(result, dtype=np.uint8)
+
+            if img.shape[0] > img.shape[1]:
+                result = result[:, 0:img.shape[1]]
+            elif img.shape[1] > img.shape[0]:
+                result = result[0:img.shape[0], :]
+
+            if len(result.shape) == 2 or (len(result.shape) == 3 and result.shape[2] == 1):
+                result = cv2.cvtColor(result, cv2.COLOR_GRAY2RGBA)
+            elif len(result.shape) == 3 and result.shape[2] == 3:
+                result = cv2.cvtColor(result, cv2.COLOR_RGB2RGBA)
+
+            if hasTransparent:
+                if "openpose" in controlnet_module:
+                    for i in range(result.shape[0]):
+                        for j in range(result.shape[1]):
+                            if result[i, j, 0] == 0 and result[i, j, 1] == 0 and result[i, j, 2] == 0:
+                                result[i, j, 3] = 0
+                else:
+                    for i in range(result.shape[0]):
+                        for j in range(result.shape[1]):
+                            if img[i, j, 3] == 0:
+                                result[i, j, 3] = 0
+
+                if controlnet_crop_transparent:
+                    top = 0
+                    bottom = result.shape[0]
+                    left = 0
+                    right = result.shape[1]
+
+                    for i in range(result.shape[0]):
+                        if np.any(result[i, :, 3] != 0):
+                            top = i
+                            break
+
+                    for i in range(result.shape[0]-1, -1, -1):
+                        if np.any(result[i, :, 3] != 0):
+                            bottom = i
+                            break
+
+                    for i in range(result.shape[1]):
+                        if np.any(result[:, i, 3] != 0):
+                            left = i
+                            break
+
+                    for i in range(result.shape[1]-1, -1, -1):
+                        if np.any(result[:, i, 3] != 0):
+                            right = i
+                            break
+
+                    result = result[top:bottom, left:right]
+
+            results.append(result)
+
+        global_state.cn_preprocessor_unloadable.get(controlnet_module, lambda: None)()
+        results64 = list(map(encode_to_base64, results))
+        return {"images": results64, "info": "Success"}
+    
 try:
     import modules.script_callbacks as script_callbacks
 
